@@ -58,63 +58,6 @@ fn days_before_year(year: i64) -> i64 {
     365 * y + y / 4 - y / 100 + y / 400
 }
 
-fn timestamp(text: &str) -> Option<i64> {
-    let b = text.as_bytes();
-    if !(matches!(b.len(), 20 | 25) && b[4] == b'-') {
-        // An overflowing F3 timestamp is outside any four-digit ISO window.
-        return decimal(b);
-    }
-    if b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
-        return None;
-    }
-    let year = decimal(&b[..4])?;
-    let month = decimal(&b[5..7])? as usize;
-    let day = decimal(&b[8..10])?;
-    let hour = decimal(&b[11..13])?;
-    let minute = decimal(&b[14..16])?;
-    let second = decimal(&b[17..19])?;
-    if year == 0 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let month_days = [
-        31,
-        28 + i64::from(leap),
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if !(1..=month_days[month - 1]).contains(&day) {
-        return None;
-    }
-    let zone_seconds = match &b[19..] {
-        b"Z" => 0,
-        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
-            let h = decimal(&b[20..22])?;
-            let m = decimal(&b[23..25])?;
-            if h > 23 || m > 59 {
-                return None;
-            }
-            (if *sign == b'+' { 1 } else { -1 }) * (h * 3600 + m * 60)
-        }
-        _ => return None,
-    };
-    const BEFORE_MONTH: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    let days = days_before_year(year) - days_before_year(1970)
-        + BEFORE_MONTH[month - 1]
-        + i64::from(month > 2 && leap)
-        + day
-        - 1;
-    Some(days * DAY + (hour * 3600 + minute * 60 + second - zone_seconds) * 1000)
-}
-
 #[path = "identity.rs"]
 mod identity;
 use identity::Names;
@@ -179,7 +122,7 @@ fn window(data: &Path) -> Result<(i64, i64), Box<dyn Error>> {
     let get = |key: &str| {
         json[key]
             .as_str()
-            .and_then(timestamp)
+            .and_then(|text| events::Calendar::default().parse(text))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("invalid {key}")))
     };
     Ok((get("window_start")?, get("window_end")?))
@@ -189,8 +132,11 @@ fn window(data: &Path) -> Result<(i64, i64), Box<dyn Error>> {
 mod events;
 #[path = "clicks.rs"]
 mod fast_clicks;
+#[path = "shards.rs"]
+mod shards;
 
 pub fn read(data: &Path) -> Result<Input, Box<dyn Error>> {
+    let began = std::time::Instant::now();
     let (start, end) = window(data)?;
     let mut users = linked_users(&data.join("links"))?;
     let mut categories = Names::default();
@@ -201,8 +147,10 @@ pub fn read(data: &Path) -> Result<Input, Box<dyn Error>> {
         .map(|[product, category]| (product, categories.id(category)))
         .collect();
 
+    let setup = std::time::Instant::now();
     let events = events::read_events(&data.join("events"), start, end, &mut users, &products)?;
 
+    let events_done = std::time::Instant::now();
     let mut campaigns = vec![("organic".to_owned(), "organic".to_owned())];
     let campaign_text = fs::read_to_string(data.join("campaigns.csv"))?;
     let mut campaign_index = HashMap::new();
@@ -211,18 +159,30 @@ pub fn read(data: &Path) -> Result<Input, Box<dyn Error>> {
         campaigns.push((id.to_owned(), channel.to_owned()));
     }
     let clicks = fast_clicks::read_clicks(
-        &read_shards(&data.join("clicks"))?,
+        &data.join("clicks"),
         start,
         end,
         &mut users,
         &campaign_index,
-    );
+    )?;
 
+    if std::env::var_os("SHOPPING_TIMINGS").is_some() {
+        eprintln!(
+            "dimensions_links={:?} events={:?} clicks={:?}",
+            setup - began,
+            events_done - setup,
+            events_done.elapsed()
+        );
+    }
     Ok(Input {
         events,
         clicks,
         users: users.names,
-        categories: categories.names,
+        categories: categories
+            .names
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect(),
         campaigns,
     })
 }

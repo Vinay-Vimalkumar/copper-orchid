@@ -1,31 +1,20 @@
-use super::{DAY, Names, fields, timestamp};
+use super::events::Calendar;
+use super::shards::Shards;
+use super::{DAY, Names, fields};
 use crate::model::Click;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::{io, path::Path};
 
 pub(super) fn read_clicks(
-    shards: &[String],
+    dir: &Path,
     start: i64,
     end: i64,
     users: &mut Names,
     campaigns: &HashMap<&str, u32>,
-) -> Vec<Click> {
-    let mut chunks = Vec::new();
-    for shard in shards {
-        let Some((_, mut data)) = shard.split_once('\n') else {
-            continue;
-        };
-        while data.len() > 512 * 1024 {
-            let boundary = 512 * 1024;
-            let Some(extra) = memchr::memchr(b'\n', &data.as_bytes()[boundary..]) else {
-                break;
-            };
-            let (chunk, remaining) = data.split_at(boundary + extra + 1);
-            chunks.push(chunk);
-            data = remaining;
-        }
-        chunks.push(data);
-    }
+) -> io::Result<Vec<Click>> {
+    let shards = Shards::open(dir)?;
+    let chunks = shards.chunks(512 * 1024);
     let min_ts = start - 7 * DAY;
     let known = &users.index;
     // Campaign IDs come from the clean input dimension and may have any spelling.
@@ -36,6 +25,9 @@ pub(super) fn read_clicks(
     let parsed: Vec<_> = chunks
         .par_iter()
         .map(|chunk| {
+            let chunk = std::str::from_utf8(chunk)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut calendar = Calendar::default();
             let mut pending = Vec::new();
             let mut rows = Vec::with_capacity(chunk.len() / 52);
             for [id, user, campaign, raw_ts] in chunk.split('\n').filter_map(fields::<4>) {
@@ -45,7 +37,10 @@ pub(super) fn read_clicks(
                 let Some(&campaign) = campaign_lookup.get(campaign) else {
                     continue;
                 };
-                let Some(ts) = timestamp(raw_ts).filter(|&ts| min_ts <= ts && ts < end) else {
+                let Some(ts) = calendar
+                    .parse(raw_ts)
+                    .filter(|&ts| min_ts <= ts && ts < end)
+                else {
                     continue;
                 };
                 let user = known.get(user).copied().unwrap_or_else(|| {
@@ -60,9 +55,9 @@ pub(super) fn read_clicks(
                     id: id.into(),
                 });
             }
-            (rows, pending)
+            Ok((rows, pending))
         })
-        .collect();
+        .collect::<io::Result<_>>()?;
     let mut clicks = Vec::with_capacity(parsed.iter().map(|(rows, _)| rows.len()).sum());
     for (mut rows, pending) in parsed {
         for (index, name) in pending {
@@ -70,5 +65,5 @@ pub(super) fn read_clicks(
         }
         clicks.append(&mut rows);
     }
-    clicks
+    Ok(clicks)
 }

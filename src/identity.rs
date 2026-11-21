@@ -47,7 +47,7 @@ impl NameIndex {
 #[derive(Default)]
 pub(super) struct Names {
     pub(super) index: NameIndex,
-    pub(super) names: Vec<String>,
+    pub(super) names: Vec<compact_str::CompactString>,
 }
 
 impl Names {
@@ -57,7 +57,7 @@ impl Names {
                 Entry::Occupied(entry) => *entry.get(),
                 Entry::Vacant(entry) => {
                     let id = u32::try_from(self.names.len()).expect("too many distinct names");
-                    self.names.push(name.to_owned());
+                    self.names.push(name.into());
                     entry.insert(id);
                     id
                 }
@@ -66,7 +66,7 @@ impl Names {
             id
         } else {
             let id = u32::try_from(self.names.len()).expect("too many distinct names");
-            self.names.push(name.to_owned());
+            self.names.push(name.into());
             self.index.other.insert(name.into(), id);
             id
         }

@@ -3,7 +3,7 @@ use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Typ
 use parquet::errors::Result as ParquetResult;
 use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
-use std::error::Error;
+use rayon::prelude::*;
 use std::fs::{self, File};
 use std::path::Path;
 use std::sync::Arc;
@@ -45,26 +45,54 @@ fn required<T: DataType>(
     column::<T>(group, &values.collect::<Vec<_>>(), None)
 }
 
-fn table<R>(
+fn part_name(index: usize) -> String {
+    if index == 0 {
+        "part.parquet".to_owned()
+    } else {
+        format!("part-{index}.parquet")
+    }
+}
+
+fn table<R: Sync>(
     folder: &Path,
     schema: &str,
     rows: &[R],
-    write_group: impl Fn(&mut SerializedRowGroupWriter<'_, File>, &[R]) -> ParquetResult<()>,
-) -> Result<(), Box<dyn Error>> {
+    write_group: impl Fn(&mut SerializedRowGroupWriter<'_, File>, &[R]) -> ParquetResult<()> + Sync,
+) -> ParquetResult<()> {
     fs::create_dir_all(folder)?;
-    let pending = folder.join(".part.tmp");
-    let mut writer = SerializedFileWriter::new(
-        File::create(&pending)?,
-        Arc::new(parse_message_type(schema)?),
-        Default::default(),
-    )?;
-    for batch in rows.chunks(32_768) {
-        let mut group = writer.next_row_group()?;
-        write_group(&mut group, batch)?;
-        group.close()?;
+    let schema = Arc::new(parse_message_type(schema)?);
+    let parts = rows
+        .len()
+        .div_ceil(65_536)
+        .clamp(1, rayon::current_num_threads());
+    let per_part = rows.len().div_ceil(parts);
+    (0..parts)
+        .into_par_iter()
+        .try_for_each(|index| -> ParquetResult<()> {
+            let part = part_name(index);
+            let pending = folder.join(format!(".{part}.tmp"));
+            let mut writer = SerializedFileWriter::new(
+                File::create(&pending)?,
+                schema.clone(),
+                Default::default(),
+            )?;
+            let part_rows = &rows[index * per_part..rows.len().min((index + 1) * per_part)];
+            for batch in part_rows.chunks(32_768) {
+                let mut group = writer.next_row_group()?;
+                write_group(&mut group, batch)?;
+                group.close()?;
+            }
+            writer.close()?;
+            fs::rename(pending, folder.join(part))?;
+            Ok(())
+        })?;
+    // A retry on a smaller input may use fewer shards than the preceding run.
+    for index in parts..8 {
+        match fs::remove_file(folder.join(part_name(index))) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
+        }
     }
-    writer.close()?;
-    fs::rename(pending, folder.join("part.parquet"))?;
     Ok(())
 }
 
@@ -73,7 +101,7 @@ pub fn write(
     input: &Input,
     users: &[UserDay],
     campaigns: &[CampaignDay],
-) -> Result<(), Box<dyn Error>> {
+) -> ParquetResult<()> {
     table(
         &out.join("user_daily"),
         USER_SCHEMA,

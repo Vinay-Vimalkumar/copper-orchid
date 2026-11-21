@@ -1,7 +1,7 @@
 pub struct Input {
     pub events: Vec<Event>,
     pub clicks: Vec<Click>,
-    pub users: Vec<String>,
+    pub users: Vec<compact_str::CompactString>,
     pub categories: Vec<String>,
     // Index zero represents an organic session.
     pub campaigns: Vec<(String, String)>,
