@@ -25,6 +25,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let start = Instant::now();
+    let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = env::var("NCPU")
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(available)
+        .clamp(1, available.min(8));
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()?;
     let mut input = input::read(&data)?;
     let parsed = Instant::now();
     let (users, campaigns) = aggregate::aggregate(&mut input);

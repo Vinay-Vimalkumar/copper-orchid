@@ -1,6 +1,5 @@
-use crate::model::{Click, Event, Input};
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use crate::model::Input;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -116,23 +115,9 @@ fn timestamp(text: &str) -> Option<i64> {
     Some(days * DAY + (hour * 3600 + minute * 60 + second - zone_seconds) * 1000)
 }
 
-#[derive(Default)]
-struct Names {
-    index: HashMap<String, u32>,
-    names: Vec<String>,
-}
-
-impl Names {
-    fn id(&mut self, name: &str) -> u32 {
-        if let Some(&id) = self.index.get(name) {
-            return id;
-        }
-        let id = u32::try_from(self.names.len()).expect("too many distinct names");
-        self.names.push(name.to_owned());
-        self.index.insert(name.to_owned(), id);
-        id
-    }
-}
+#[path = "identity.rs"]
+mod identity;
+use identity::Names;
 
 struct Component {
     parent: u32,
@@ -200,104 +185,10 @@ fn window(data: &Path) -> Result<(i64, i64), Box<dyn Error>> {
     Ok((get("window_start")?, get("window_end")?))
 }
 
-fn read_events(
-    shards: &[String],
-    start: i64,
-    end: i64,
-    users: &mut Names,
-    products: &HashMap<&str, u32>,
-) -> Vec<Event> {
-    // Keep the winning raw row even when it will subsequently fail validation.
-    // Hash slots hold an index so the validation pass walks winners in read order.
-    let mut positions = HashMap::<&str, usize>::new();
-    let mut winners: Vec<&str> = Vec::new();
-    for line in shards.iter().flat_map(|shard| lines(shard)) {
-        let Some([id, _, _, ingest, _, _, _]) = fields(line) else {
-            continue;
-        };
-        if id.is_empty() {
-            continue;
-        }
-        match positions.entry(id) {
-            Entry::Vacant(entry) => {
-                entry.insert(winners.len());
-                winners.push(line);
-            }
-            Entry::Occupied(entry) => {
-                let winner = &mut winners[*entry.get()];
-                // All ingest timestamps are valid fixed-width UTC F1.
-                let old_ingest = winner.split(',').nth(3).unwrap().trim_matches('"');
-                if ingest < old_ingest {
-                    *winner = line;
-                }
-            }
-        }
-    }
-    drop(positions);
-    let mut events = Vec::with_capacity(winners.len());
-    for winner in winners {
-        let [_, user, raw_ts, ingest, kind, product, price] = fields(winner).unwrap();
-        if user.is_empty() || product.is_empty() {
-            continue;
-        }
-        let Some(ts) = timestamp(raw_ts).filter(|&ts| start <= ts && ts < end) else {
-            continue;
-        };
-        if timestamp(ingest).expect("ingest_ts must be valid F1") - ts > DAY {
-            continue;
-        }
-        let (price, category) = match kind {
-            "view" | "cart" => (0, 0),
-            "purchase" => {
-                let Some(price) =
-                    decimal(price.as_bytes()).filter(|v| (1..=10_000_000).contains(v))
-                else {
-                    continue;
-                };
-                (price as u32, products.get(product).copied().unwrap_or(0))
-            }
-            _ => continue,
-        };
-        events.push(Event {
-            ts,
-            user: users.id(user),
-            category,
-            price,
-        });
-    }
-    events
-}
-
-fn read_clicks(
-    shards: &[String],
-    start: i64,
-    end: i64,
-    users: &mut Names,
-    campaigns: &HashMap<&str, u32>,
-) -> Vec<Click> {
-    let mut seen = HashSet::new();
-    let mut clicks = Vec::new();
-    for shard in shards {
-        for [id, user, campaign, raw_ts] in lines(shard).filter_map(fields::<4>) {
-            if id.is_empty() || !seen.insert(id) || user.is_empty() {
-                continue;
-            }
-            let Some(&campaign) = campaigns.get(campaign) else {
-                continue;
-            };
-            let Some(ts) = timestamp(raw_ts).filter(|&ts| start - 7 * DAY <= ts && ts < end) else {
-                continue;
-            };
-            clicks.push(Click {
-                ts,
-                user: users.id(user),
-                campaign,
-                id: id.into(),
-            });
-        }
-    }
-    clicks
-}
+#[path = "events.rs"]
+mod events;
+#[path = "clicks.rs"]
+mod fast_clicks;
 
 pub fn read(data: &Path) -> Result<Input, Box<dyn Error>> {
     let (start, end) = window(data)?;
@@ -310,13 +201,7 @@ pub fn read(data: &Path) -> Result<Input, Box<dyn Error>> {
         .map(|[product, category]| (product, categories.id(category)))
         .collect();
 
-    let events = read_events(
-        &read_shards(&data.join("events"))?,
-        start,
-        end,
-        &mut users,
-        &products,
-    );
+    let events = events::read_events(&data.join("events"), start, end, &mut users, &products)?;
 
     let mut campaigns = vec![("organic".to_owned(), "organic".to_owned())];
     let campaign_text = fs::read_to_string(data.join("campaigns.csv"))?;
@@ -325,7 +210,7 @@ pub fn read(data: &Path) -> Result<Input, Box<dyn Error>> {
         campaign_index.insert(id, u32::try_from(campaigns.len())?);
         campaigns.push((id.to_owned(), channel.to_owned()));
     }
-    let clicks = read_clicks(
+    let clicks = fast_clicks::read_clicks(
         &read_shards(&data.join("clicks"))?,
         start,
         end,

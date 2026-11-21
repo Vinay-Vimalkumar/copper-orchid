@@ -19,7 +19,7 @@ pub struct Click {
     pub user: u32,
     pub ts: i64,
     pub campaign: u32,
-    pub id: Box<str>,
+    pub id: compact_str::CompactString,
 }
 
 #[derive(Default)]
