@@ -7,17 +7,6 @@ use std::path::Path;
 
 const DAY: i64 = 86_400_000;
 
-fn read_shards(dir: &Path) -> io::Result<Vec<String>> {
-    let mut shards = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|ext| ext == "csv") {
-            shards.push(fs::read_to_string(path)?);
-        }
-    }
-    Ok(shards)
-}
-
 fn lines(text: &str) -> impl Iterator<Item = &str> {
     // str::lines would discard a CR before LF; CR is field data here.
     text.split('\n').skip(1)
@@ -60,62 +49,7 @@ fn days_before_year(year: i64) -> i64 {
 
 #[path = "identity.rs"]
 mod identity;
-use identity::Names;
-
-struct Component {
-    parent: u32,
-    size: u32,
-    smallest: u32,
-}
-
-fn root(sets: &mut [Component], mut node: u32) -> u32 {
-    while sets[node as usize].parent != node {
-        let parent = sets[node as usize].parent as usize;
-        sets[node as usize].parent = sets[parent].parent;
-        node = sets[parent].parent;
-    }
-    node
-}
-
-fn linked_users(dir: &Path) -> io::Result<Names> {
-    let mut users = Names::default();
-    let mut sets: Vec<Component> = Vec::new();
-    for shard in read_shards(dir)? {
-        for [a, b] in lines(&shard).filter_map(fields::<2>) {
-            if a.is_empty() || b.is_empty() {
-                continue;
-            }
-            let a = users.id(a);
-            let b = users.id(b);
-            while sets.len() < users.names.len() {
-                let id = sets.len() as u32;
-                sets.push(Component {
-                    parent: id,
-                    size: 1,
-                    smallest: id,
-                });
-            }
-            let mut a = root(&mut sets, a) as usize;
-            let mut b = root(&mut sets, b) as usize;
-            if a == b {
-                continue;
-            }
-            if sets[a].size < sets[b].size {
-                std::mem::swap(&mut a, &mut b);
-            }
-            sets[b].parent = a as u32;
-            sets[a].size += sets[b].size;
-            if users.names[sets[b].smallest as usize] < users.names[sets[a].smallest as usize] {
-                sets[a].smallest = sets[b].smallest;
-            }
-        }
-    }
-    for id in users.index.values_mut() {
-        let component = root(&mut sets, *id) as usize;
-        *id = sets[component].smallest;
-    }
-    Ok(users)
-}
+use identity::{Names, linked_users};
 
 fn window(data: &Path) -> Result<(i64, i64), Box<dyn Error>> {
     let json: serde_json::Value = serde_json::from_slice(&fs::read(data.join("manifest.json"))?)?;
@@ -158,7 +92,7 @@ pub fn read(data: &Path) -> Result<Input, Box<dyn Error>> {
         campaign_index.insert(id, u32::try_from(campaigns.len())?);
         campaigns.push((id.to_owned(), channel.to_owned()));
     }
-    let clicks = fast_clicks::read_clicks(
+    let (clicks, other_click_ids) = fast_clicks::read_clicks(
         &data.join("clicks"),
         start,
         end,
@@ -177,6 +111,7 @@ pub fn read(data: &Path) -> Result<Input, Box<dyn Error>> {
     Ok(Input {
         events,
         clicks,
+        other_click_ids,
         users: users.names,
         categories: categories
             .names

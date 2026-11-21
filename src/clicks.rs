@@ -1,7 +1,7 @@
 use super::events::Calendar;
 use super::shards::Shards;
 use super::{DAY, Names, fields};
-use crate::model::Click;
+use crate::model::{Click, ClickId};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::{io, path::Path};
@@ -12,7 +12,7 @@ pub(super) fn read_clicks(
     end: i64,
     users: &mut Names,
     campaigns: &HashMap<&str, u32>,
-) -> io::Result<Vec<Click>> {
+) -> io::Result<(Vec<Click>, Vec<Box<str>>)> {
     let shards = Shards::open(dir)?;
     let chunks = shards.chunks(512 * 1024);
     let min_ts = start - 7 * DAY;
@@ -29,6 +29,7 @@ pub(super) fn read_clicks(
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let mut calendar = Calendar::default();
             let mut pending = Vec::new();
+            let mut other_ids = Vec::new();
             let mut rows = Vec::with_capacity(chunk.len() / 52);
             for [id, user, campaign, raw_ts] in chunk.split('\n').filter_map(fields::<4>) {
                 if user.is_empty() || id.is_empty() {
@@ -48,22 +49,35 @@ pub(super) fn read_clicks(
                     0
                 });
                 // Identical copies become adjacent in the per-person attribution sort.
+                let id = ClickId::pack(id).unwrap_or_else(|| {
+                    other_ids.push((rows.len(), id));
+                    ClickId::default()
+                });
                 rows.push(Click {
                     user,
                     ts,
                     campaign,
-                    id: id.into(),
+                    id,
                 });
             }
-            Ok((rows, pending))
+            Ok((rows, pending, other_ids))
         })
         .collect::<io::Result<_>>()?;
-    let mut clicks = Vec::with_capacity(parsed.iter().map(|(rows, _)| rows.len()).sum());
-    for (mut rows, pending) in parsed {
+    let mut clicks = Vec::with_capacity(parsed.iter().map(|(rows, _, _)| rows.len()).sum());
+    let mut other_click_ids = Vec::new();
+    let mut index = ahash::AHashMap::new();
+    for (mut rows, pending, other_ids) in parsed {
+        for (row, id) in other_ids {
+            rows[row].id = *index.entry(id).or_insert_with(|| {
+                let key = ClickId::other(other_click_ids.len());
+                other_click_ids.push(id.into());
+                key
+            });
+        }
         for (index, name) in pending {
             rows[index].user = users.id(name);
         }
         clicks.append(&mut rows);
     }
-    Ok(clicks)
+    Ok((clicks, other_click_ids))
 }

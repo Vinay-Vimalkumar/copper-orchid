@@ -142,9 +142,9 @@ struct Action {
 }
 
 #[derive(Clone, Copy, Default)]
-struct Touch<'a> {
+struct Touch {
     ts: i64,
-    id: &'a str,
+    id: crate::model::ClickId,
     campaign: u32,
 }
 
@@ -199,6 +199,7 @@ fn aggregate_people(
     people: Range<usize>,
     event_groups: &[PersonGroups<Action>],
     click_groups: &[PersonGroups<Touch>],
+    other_ids: &[Box<str>],
     categories: &[String],
     campaign_count: usize,
 ) -> (Vec<UserDay>, CampaignTotals) {
@@ -224,7 +225,7 @@ fn aggregate_people(
             history.extend_from_slice(group.person(user));
         }
         // Reverse ID order on equal timestamps places the winning click last.
-        history.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.cmp(a.id)));
+        history.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.cmp(a.id, other_ids)));
         attribution.start_person();
         let mut sessions = events
             .chunk_by(|a, b| b.ts - a.ts <= SESSION_GAP)
@@ -297,7 +298,7 @@ pub fn aggregate(input: &mut Input) -> (Vec<UserDay>, Vec<CampaignDay>) {
                 |c| c.user,
                 |c| Touch {
                     ts: c.ts,
-                    id: c.id.as_str(),
+                    id: c.id,
                     campaign: c.campaign,
                 },
             )
@@ -312,6 +313,7 @@ pub fn aggregate(input: &mut Input) -> (Vec<UserDay>, Vec<CampaignDay>) {
                 batch * batch_size..((batch + 1) * batch_size).min(people),
                 &events,
                 &clicks,
+                &input.other_click_ids,
                 &input.categories,
                 input.campaigns.len(),
             )
