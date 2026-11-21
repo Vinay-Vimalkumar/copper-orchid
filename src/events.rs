@@ -19,113 +19,142 @@ fn pair(b: &[u8], i: usize) -> Option<i64> {
     (a < 10 && b < 10).then(|| i64::from(a) * 10 + i64::from(b))
 }
 
-// The input window spans few months. Cache the verified date and check the entire
-// year-month prefix on every hit, including both hyphens.
-#[derive(Default)]
+const NIBBLES: u64 = 0xf0f0_f0f0_f0f0_f0f0;
+const SIXES: u64 = 0x0606_0606_0606_0606;
+
+#[inline]
+fn decimal_eight(digits: u64) -> u64 {
+    let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let groups = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+    (groups as u32 as u64) * 10_000 + (groups >> 32)
+}
+
+#[inline]
+fn epoch13(b: &[u8]) -> Option<i64> {
+    let zeros = 0x3030_3030_3030_3030;
+    let a = u64::from_le_bytes(b[..8].try_into().unwrap()) ^ zeros;
+    // Reuse the last eight input bytes, keeping the five-digit suffix.
+    let c = (u64::from_le_bytes(b[5..13].try_into().unwrap()) ^ zeros) & !0x00ff_ffff;
+    if (a | c | a.wrapping_add(SIXES) | c.wrapping_add(SIXES)) & NIBBLES != 0 {
+        return None;
+    }
+    Some((decimal_eight(a) * 100_000 + decimal_eight(c)) as i64)
+}
+
+#[inline]
+fn seconds_of_day(b: &[u8]) -> Option<i64> {
+    // Read HH:MM:SS in one word. Values in the punctuation lanes must be zero
+    // after XOR. The six other lanes must be ASCII digits in 0..=9.
+    let digits =
+        u64::from_le_bytes(b[11..19].try_into().unwrap()) ^ u64::from_le_bytes(*b"00:00:00");
+    let check = u64::from_le_bytes([0xf0, 0xf0, 0xff, 0xf0, 0xf0, 0xff, 0xf0, 0xf0]);
+    let sixes = u64::from_le_bytes([6, 6, 0, 6, 6, 0, 6, 6]);
+    if (digits | digits.wrapping_add(sixes)) & check != 0 {
+        return None;
+    }
+    let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_0000_ff00_00ff;
+    let biases = u64::from_le_bytes([232, 0, 0, 196, 0, 0, 196, 0]);
+    if (pairs + biases) & 0x0100_0001_0000_0100 != 0 {
+        return None;
+    }
+    Some(((pairs & 255) * 3600 + ((pairs >> 24) & 255) * 60 + (pairs >> 48)) as i64)
+}
+
 pub(super) struct Calendar {
-    days: [Option<(u64, i64)>; 32],
+    keys: [u64; 32],
+    starts: [i64; 32],
+}
+
+impl Default for Calendar {
+    fn default() -> Self {
+        // A UTF-8 value cannot begin with 0xff, so this key never hits.
+        Self {
+            keys: [u64::MAX; 32],
+            starts: [0; 32],
+        }
+    }
 }
 
 impl Calendar {
     #[inline]
     fn midnight(&mut self, b: &[u8]) -> Option<i64> {
-        let day = pair(b, 8)? as usize;
-        if !(1..32).contains(&day) {
+        if b[7] != b'-' {
             return None;
         }
-        let prefix = u64::from_ne_bytes(b[..8].try_into().unwrap());
-        Some(match self.days[day] {
-            Some((old, ms)) if prefix == old => ms,
-            _ => {
-                if b[7] != b'-' {
-                    return None;
-                }
-                let year = pair(b, 0)? * 100 + pair(b, 2)?;
-                let month = pair(b, 5)? as usize;
-                if year == 0 || !(1..=12).contains(&month) {
-                    return None;
-                }
-                let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-                let lengths = [
-                    31,
-                    28 + usize::from(leap),
-                    31,
-                    30,
-                    31,
-                    30,
-                    31,
-                    31,
-                    30,
-                    31,
-                    30,
-                    31,
-                ];
-                if day > lengths[month - 1] {
-                    return None;
-                }
-                let days = days_before_year(year) - days_before_year(1970)
-                    + lengths[..month - 1].iter().sum::<usize>() as i64
-                    + day as i64
-                    - 1;
-                let ms = days * DAY;
-                self.days[day] = Some((prefix, ms));
-                ms
+        // The caller already checked b[4]. Use the two fixed hyphen positions
+        // to fold the day into an exact eight-byte key for this ten-byte date.
+        let key = u64::from_le_bytes(b[..8].try_into().unwrap())
+            ^ (u64::from(b[8]) << 32)
+            ^ (u64::from(b[9]) << 56);
+        let slot = (usize::from(b[8]) * 10 + usize::from(b[9])) & 31;
+        if self.keys[slot] != key {
+            let day = pair(b, 8)? as usize;
+            if !(1..32).contains(&day) {
+                return None;
             }
-        })
+            let year = pair(b, 0)? * 100 + pair(b, 2)?;
+            let month = pair(b, 5)? as usize;
+            if year == 0 || !(1..=12).contains(&month) {
+                return None;
+            }
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            let lengths = [
+                31,
+                28 + usize::from(leap),
+                31,
+                30,
+                31,
+                30,
+                31,
+                31,
+                30,
+                31,
+                30,
+                31,
+            ];
+            if day > lengths[month - 1] {
+                return None;
+            }
+            let days = days_before_year(year) - days_before_year(1970)
+                + lengths[..month - 1].iter().sum::<usize>() as i64
+                + day as i64
+                - 1;
+            let ms = days * DAY;
+
+            self.keys[slot] = key;
+            self.starts[slot] = ms;
+        }
+        Some(self.starts[slot])
     }
 
     #[inline]
     pub(super) fn parse(&mut self, text: &str) -> Option<i64> {
         let b = text.as_bytes();
+        if b.len() == 13 {
+            return epoch13(b);
+        }
         if !matches!(b.len(), 20 | 25) || b[4] != b'-' {
-            if let [prefix @ .., a, b, c, d, e] = b
-                && prefix.len() == 8
-            {
-                let word = u64::from_le_bytes(prefix.try_into().unwrap());
-                let high = 0xf0f0_f0f0_f0f0_f0f0;
-                let ascii_zero = 0x3030_3030_3030_3030;
-                if word & high != ascii_zero
-                    || word.wrapping_add(0x0606_0606_0606_0606) & high != ascii_zero
-                {
-                    return None;
-                }
-                let digits = word & !high;
-                let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
-                let groups = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
-                let prefix = (groups as u32 as i64) * 10_000 + (groups >> 32) as i64;
-                let suffix = [a, b, c, d, e].into_iter().try_fold(0, |acc, byte| {
-                    let digit = byte.wrapping_sub(b'0');
-                    (digit < 10).then(|| acc * 10 + i64::from(digit))
-                })?;
-                return Some(prefix * 100_000 + suffix);
-            }
             return decimal(b);
         }
-        if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        if b[10] != b'T' {
             return None;
         }
         let midnight = self.midnight(b)?;
-        let hour = pair(b, 11)?;
-        let minute = pair(b, 14)?;
-        let second = pair(b, 17)?;
-        if hour >= 24 || minute >= 60 || second >= 60 {
-            return None;
-        }
-        let mut seconds = hour * 3600 + minute * 60 + second;
+        let mut sec = seconds_of_day(b)?;
         match &b[19..] {
             b"Z" => {}
             [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
-                let hour = pair(b, 20)?;
-                let minute = pair(b, 23)?;
-                if hour >= 24 || minute >= 60 {
+                let h = pair(b, 20)?;
+                let m = pair(b, 23)?;
+                if h >= 24 || m >= 60 {
                     return None;
                 }
-                let offset = hour * 3600 + minute * 60;
-                seconds += if *sign == b'+' { -offset } else { offset };
+                let offset = (h * 60 + m) * 60;
+                sec += if *sign == b'+' { -offset } else { offset };
             }
             _ => return None,
         }
-        Some(midnight + seconds * 1000)
+        Some(midnight + sec * 1000)
     }
 }
 
