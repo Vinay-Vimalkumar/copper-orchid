@@ -203,14 +203,14 @@ struct Batch<'a> {
     purchases: Vec<(u32, u32)>,
 }
 
-// Assign a shared provisional index to each common unlinked user. Occupied slots
+// Assign a shared provisional index to each common event-user spelling. Occupied slots
 // never move. Failed probes go to the per-chunk text dictionary, which is merged
 // by full byte equality after the scan.
-struct MissingUsers {
+struct SharedUsers {
     slots: Vec<AtomicU64>,
 }
 
-impl MissingUsers {
+impl SharedUsers {
     fn new(input_bytes: usize) -> Self {
         let capacity = (input_bytes / 1024).clamp(64, 1 << 23).next_power_of_two();
         Self {
@@ -266,7 +266,7 @@ struct Catalog<'a> {
     start: i64,
     end: i64,
     users: &'a Names,
-    shared: &'a MissingUsers,
+    shared: &'a SharedUsers,
     products: &'a HashMap<&'a str, u32>,
 }
 
@@ -307,11 +307,14 @@ fn parse_chunk<'a>(chunk: &'a str, partitions: usize, catalog: &Catalog) -> Batc
             };
             let item = match (ts, price) {
                 (Some(ts), Some(price)) if !user.is_empty() && !product.is_empty() => {
-                    let user = catalog.users.index.get(user).copied().unwrap_or_else(|| {
-                        if let Some(slot) = catalog.shared.index(user) {
-                            return u32::try_from(catalog.users.names.len() + slot as usize)
-                                .expect("too many distinct names");
-                        }
+                    // Resolve every inline spelling once after the scan. On a full
+                    // probe chain or a general spelling, consult the linked-user map.
+                    let user = if let Some(slot) = catalog.shared.index(user) {
+                        u32::try_from(catalog.users.names.len() + slot as usize)
+                            .expect("too many distinct names")
+                    } else if let Some(&person) = catalog.users.index.get(user) {
+                        person
+                    } else {
                         *missing.entry(user).or_insert_with(|| {
                             let id = u32::try_from(
                                 catalog.users.names.len()
@@ -322,7 +325,7 @@ fn parse_chunk<'a>(chunk: &'a str, partitions: usize, catalog: &Catalog) -> Batc
                             unresolved.push(user);
                             id
                         })
-                    });
+                    };
                     let purchase = if price == 0 {
                         0
                     } else {
@@ -458,7 +461,7 @@ pub(super) fn read_events(
     let started = Instant::now();
     let maps = Shards::open(dir)?;
     let chunks = maps.chunks(CHUNK);
-    let shared = MissingUsers::new(chunks.iter().map(|c| c.len()).sum());
+    let shared = SharedUsers::new(chunks.iter().map(|c| c.len()).sum());
     let partitions = chunks.len().clamp(1, 256).next_power_of_two();
     let base = u32::try_from(users.names.len()).expect("too many distinct names");
     let catalog = Catalog {
