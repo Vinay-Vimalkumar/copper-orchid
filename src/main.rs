@@ -1,4 +1,5 @@
 mod aggregate;
+mod csv;
 mod input;
 mod model;
 mod output;

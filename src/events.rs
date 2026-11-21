@@ -241,36 +241,6 @@ struct Catalog<'a> {
     products: &'a HashMap<&'a str, u32>,
 }
 
-#[inline]
-fn event_fields(line: &str) -> Option<[&str; 7]> {
-    let bytes = line.as_bytes();
-    let quote_count = memchr::memchr_iter(b'"', bytes).count();
-    let mut quotes_used = 0;
-    let mut start = 0;
-    let mut values = [""; 7];
-    let mut commas = memchr::memchr_iter(b',', bytes);
-    for (index, value) in values.iter_mut().enumerate() {
-        let end = if index < 6 {
-            commas.next()?
-        } else {
-            if commas.next().is_some() {
-                return None;
-            }
-            bytes.len()
-        };
-        let (lo, hi) = if end >= start + 2 && bytes[start] == b'"' && bytes[end - 1] == b'"' {
-            quotes_used += 2;
-            (start + 1, end - 1)
-        } else {
-            (start, end)
-        };
-        // Input is UTF-8. ASCII commas and quotes delimit character boundaries.
-        *value = unsafe { line.get_unchecked(lo..hi) };
-        start = end + 1;
-    }
-    (quote_count == quotes_used).then_some(values)
-}
-
 fn parse_chunk<'a>(chunk: &'a str, partitions: usize, catalog: &Catalog) -> Batch<'a> {
     let mut calendar = Calendar::default();
     let mut missing = HashMap::<&str, u32>::new();
@@ -283,78 +253,80 @@ fn parse_chunk<'a>(chunk: &'a str, partitions: usize, catalog: &Catalog) -> Batc
         })
         .collect();
     let mask = partitions - 1;
-    for line in chunk.split('\n') {
-        let Some([id, user, raw_ts, ingest, kind, product, raw_price]) = event_fields(line) else {
-            continue;
-        };
-        if id.is_empty() {
-            continue;
-        }
-        // Published ingests are F1. Also tolerate repeated headers in concatenated shards.
-        if ingest.len() != 20 || !ingest.ends_with('Z') {
-            continue;
-        }
-        let Some(ingest) = calendar.parse(ingest) else {
-            continue;
-        };
-        let ts = calendar
-            .parse(raw_ts)
-            .filter(|&ts| catalog.start <= ts && ts < catalog.end && ingest - ts <= DAY);
-        let price = match kind {
-            "view" | "cart" => Some(0),
-            "purchase" => decimal(raw_price.as_bytes()).filter(|v| (1..=10_000_000).contains(v)),
-            _ => None,
-        };
-        let item = match (ts, price) {
-            (Some(ts), Some(price)) if !user.is_empty() && !product.is_empty() => {
-                let user = catalog.users.index.get(user).copied().unwrap_or_else(|| {
-                    if let Some(slot) = catalog.shared.index(user) {
-                        return u32::try_from(catalog.users.names.len() + slot as usize)
-                            .expect("too many distinct names");
-                    }
-                    *missing.entry(user).or_insert_with(|| {
-                        let id = u32::try_from(
-                            catalog.users.names.len()
-                                + catalog.shared.slots.len()
-                                + unresolved.len(),
-                        )
-                        .expect("too many distinct names");
-                        unresolved.push(user);
-                        id
-                    })
-                });
-                let purchase = if price == 0 {
-                    0
-                } else {
-                    let category = catalog.products.get(product).copied().unwrap_or(0);
-                    purchases.push((category, price as u32));
-                    u32::try_from(purchases.len()).expect("too many purchases in one chunk")
-                };
-                Candidate {
-                    ingest,
-                    ts,
-                    user,
-                    purchase,
-                }
+    crate::csv::rows::<7>(
+        chunk,
+        |[id, user, raw_ts, ingest, kind, product, raw_price]| {
+            if id.is_empty() {
+                return;
             }
-            // Invalid earliest copies must still suppress later valid copies.
-            _ => Candidate {
-                ingest,
-                ts: INVALID,
-                user: 0,
-                purchase: 0,
-            },
-        };
-        if let Some(key) = inline_id(id, b'e').filter(|&key| key != 0) {
-            buckets[mix(key) & mask].packed.push((key, item));
-        } else {
-            let hash = id
-                .as_bytes()
-                .iter()
-                .fold(0u64, |acc, &c| acc.wrapping_mul(257).wrapping_add(c.into()));
-            buckets[mix(hash) & mask].text.push((id, item));
-        }
-    }
+            // Published ingests are F1. Also tolerate repeated headers in concatenated shards.
+            if ingest.len() != 20 || !ingest.ends_with('Z') {
+                return;
+            }
+            let Some(ingest) = calendar.parse(ingest) else {
+                return;
+            };
+            let ts = calendar
+                .parse(raw_ts)
+                .filter(|&ts| catalog.start <= ts && ts < catalog.end && ingest - ts <= DAY);
+            let price = match kind {
+                "view" | "cart" => Some(0),
+                "purchase" => {
+                    decimal(raw_price.as_bytes()).filter(|v| (1..=10_000_000).contains(v))
+                }
+                _ => None,
+            };
+            let item = match (ts, price) {
+                (Some(ts), Some(price)) if !user.is_empty() && !product.is_empty() => {
+                    let user = catalog.users.index.get(user).copied().unwrap_or_else(|| {
+                        if let Some(slot) = catalog.shared.index(user) {
+                            return u32::try_from(catalog.users.names.len() + slot as usize)
+                                .expect("too many distinct names");
+                        }
+                        *missing.entry(user).or_insert_with(|| {
+                            let id = u32::try_from(
+                                catalog.users.names.len()
+                                    + catalog.shared.slots.len()
+                                    + unresolved.len(),
+                            )
+                            .expect("too many distinct names");
+                            unresolved.push(user);
+                            id
+                        })
+                    });
+                    let purchase = if price == 0 {
+                        0
+                    } else {
+                        let category = catalog.products.get(product).copied().unwrap_or(0);
+                        purchases.push((category, price as u32));
+                        u32::try_from(purchases.len()).expect("too many purchases in one chunk")
+                    };
+                    Candidate {
+                        ingest,
+                        ts,
+                        user,
+                        purchase,
+                    }
+                }
+                // Invalid earliest copies must still suppress later valid copies.
+                _ => Candidate {
+                    ingest,
+                    ts: INVALID,
+                    user: 0,
+                    purchase: 0,
+                },
+            };
+            if let Some(key) = inline_id(id, b'e').filter(|&key| key != 0) {
+                buckets[mix(key) & mask].packed.push((key, item));
+            } else {
+                let hash = id
+                    .as_bytes()
+                    .iter()
+                    .fold(0u64, |acc, &c| acc.wrapping_mul(257).wrapping_add(c.into()));
+                buckets[mix(hash) & mask].text.push((id, item));
+            }
+        },
+    );
     Batch {
         buckets,
         unresolved,

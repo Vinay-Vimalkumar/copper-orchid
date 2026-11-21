@@ -1,6 +1,6 @@
 use super::events::Calendar;
 use super::shards::Shards;
-use super::{DAY, Names, fields};
+use super::{DAY, Names};
 use crate::model::{Click, ClickId};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -31,18 +31,18 @@ pub(super) fn read_clicks(
             let mut pending = Vec::new();
             let mut other_ids = Vec::new();
             let mut rows = Vec::with_capacity(chunk.len() / 52);
-            for [id, user, campaign, raw_ts] in chunk.split('\n').filter_map(fields::<4>) {
+            crate::csv::rows::<4>(chunk, |[id, user, campaign, raw_ts]| {
                 if user.is_empty() || id.is_empty() {
-                    continue;
+                    return;
                 }
                 let Some(&campaign) = campaign_lookup.get(campaign) else {
-                    continue;
+                    return;
                 };
                 let Some(ts) = calendar
                     .parse(raw_ts)
                     .filter(|&ts| min_ts <= ts && ts < end)
                 else {
-                    continue;
+                    return;
                 };
                 let user = known.get(user).copied().unwrap_or_else(|| {
                     pending.push((rows.len(), user));
@@ -59,7 +59,7 @@ pub(super) fn read_clicks(
                     campaign,
                     id,
                 });
-            }
+            });
             Ok((rows, pending, other_ids))
         })
         .collect::<io::Result<_>>()?;
